@@ -2,6 +2,35 @@ import Vapor
 import Crypto // For HMAC
 import NIOCore
 
+// Simple in-memory rate limiter
+actor RateLimiter {
+    private var requests: [String: [Date]] = [:]
+    private let maxRequests: Int
+    private let windowSeconds: TimeInterval
+    
+    init(maxRequests: Int = 100, windowSeconds: TimeInterval = 60) {
+        self.maxRequests = maxRequests
+        self.windowSeconds = windowSeconds
+    }
+    
+    func shouldAllow(key: String) -> Bool {
+        let now = Date()
+        let windowStart = now.addingTimeInterval(-windowSeconds)
+        
+        // Clean old requests
+        requests[key] = requests[key]?.filter { $0 > windowStart } ?? []
+        
+        // Check if under limit
+        let requestCount = requests[key]?.count ?? 0
+        if requestCount < maxRequests {
+            requests[key, default: []].append(now)
+            return true
+        }
+        
+        return false
+    }
+}
+
 func routes(_ app: Application) throws {
     // --- Environment Variables ---
     guard let verifyToken = Environment.get("VERIFY_TOKEN") else {
@@ -13,9 +42,39 @@ func routes(_ app: Application) throws {
     guard let pageAccessToken = Environment.get("PAGE_ACCESS_TOKEN") else {
         fatalError("PAGE_ACCESS_TOKEN not set in environment")
     }
+    
+    // --- NaraServer Configuration ---
+    guard let naraServerUrl = Environment.get("NARA_SERVER_URL") else {
+        fatalError("NARA_SERVER_URL not set in environment")
+    }
+    guard let naraServerApiKey = Environment.get("NARA_SERVER_API_KEY") else {
+        fatalError("NARA_SERVER_API_KEY not set in environment")
+    }
+    let naraServerWsUrl = Environment.get("NARA_SERVER_WS_URL") ?? "\(naraServerUrl.replacingOccurrences(of: "https://", with: "wss://").replacingOccurrences(of: "http://", with: "ws://"))/live"
+    let relayDeviceId = Environment.get("RELAY_DEVICE_ID") ?? "webhook_relay_1"
+    let relayMode = Environment.get("RELAY_MODE") ?? "forward"
 
     // --- SSE Management ---
     let sseManager = SSEManager()
+    
+    // --- Rate Limiting ---
+    let rateLimiter = RateLimiter(maxRequests: 100, windowSeconds: 60)
+    
+    // --- NaraServer WebSocket Connection ---
+    let naraServerConnection = NaraServerConnection(
+        sseManager: sseManager,
+        naraServerWsUrl: naraServerWsUrl,
+        naraServerApiKey: naraServerApiKey,
+        relayDeviceId: relayDeviceId
+    )
+    
+    // Connect to NaraServer WebSocket on startup
+    Task {
+        await naraServerConnection.connect(app: app)
+    }
+    
+    // Ensure clean shutdown
+    app.lifecycle.use(NaraServerConnectionLifecycleHandler(connection: naraServerConnection))
 
     // --- Middleware for Signature Verification ---
     let facebookSignatureMiddleware = FacebookSignatureMiddleware(appSecret: appSecret)
@@ -45,6 +104,15 @@ func routes(_ app: Application) throws {
     app.grouped(facebookSignatureMiddleware).post("webhook") { req -> HTTPStatus in
         req.logger.info("Received POST /webhook request")
         
+        // Apply rate limiting based on sender IP
+        let clientIP = req.headers.first(name: "X-Forwarded-For") ?? req.remoteAddress?.description ?? "unknown"
+        let allowed = await rateLimiter.shouldAllow(key: clientIP)
+        
+        guard allowed else {
+            req.logger.warning("Rate limit exceeded for IP: \(clientIP)")
+            throw Abort(.tooManyRequests, reason: "Rate limit exceeded")
+        }
+        
         let webhookEvent: FacebookWebhookEvent
         do {
             webhookEvent = try req.content.decode(FacebookWebhookEvent.self)
@@ -55,20 +123,31 @@ func routes(_ app: Application) throws {
             return .ok
         }
 
-        if webhookEvent.object == "page" {
-            for entry in webhookEvent.entry {
-                if let messagingEvents = entry.messaging {
-                    for event in messagingEvents {
-                        await handleMessagingEvent(event, req: req, sseManager: sseManager, pageAccessToken: pageAccessToken)
+        // Forward to NaraServer if in forward mode
+        if relayMode == "forward" || relayMode == "both" {
+            do {
+                try await forwardToNaraServer(webhookEvent, req: req, naraServerUrl: naraServerUrl, naraServerApiKey: naraServerApiKey)
+            } catch {
+                req.logger.error("Failed to forward webhook to NaraServer: \(error)")
+                // Continue processing locally as fallback during migration
+            }
+        }
+
+        // Process locally if in process mode or both
+        if relayMode == "process" || relayMode == "both" {
+            if webhookEvent.object == "page" {
+                for entry in webhookEvent.entry {
+                    if let messagingEvents = entry.messaging {
+                        for event in messagingEvents {
+                            await handleMessagingEvent(event, req: req, sseManager: sseManager, pageAccessToken: pageAccessToken)
+                        }
                     }
                 }
             }
-            req.logger.info("✅ EVENT_RECEIVED")
-            return .ok
-        } else {
-            req.logger.warning("Received non-page object: \(webhookEvent.object)")
-            throw Abort(.notFound)
         }
+        
+        req.logger.info("✅ EVENT_RECEIVED (mode: \(relayMode))")
+        return .ok
     }
 
     // In routes.swift
@@ -143,12 +222,112 @@ func routes(_ app: Application) throws {
     // --- Health Check Endpoint ---
     app.get("health") { req async -> HealthStatus in
         let count = await sseManager.getConnectionCount()
+        let serverConnected = await naraServerConnection.isConnected()
         return HealthStatus(
             status: "healthy",
             timestamp: Date().iso8601,
-            connections: count
+            connections: count,
+            serverConnected: serverConnected
         )
     }
+    
+    // --- Message Sending Proxy ---
+    app.post("api", "facebook", "send") { req async throws -> Response in
+        // Verify authentication if needed
+        // For now, we'll just forward the request
+        
+        let uri = URI(string: "\(naraServerUrl)/api/v1/messages/send")
+        var headers = HTTPHeaders()
+        headers.add(name: .contentType, value: "application/json")
+        headers.add(name: .authorization, value: "Bearer \(naraServerApiKey)")
+        
+        // Collect the request body
+        let bodyBuffer = try await req.body.collect(max: 10 * 1024 * 1024).get() // 10MB max
+        
+        // Forward the request body
+        let response = try await req.client.post(uri, headers: headers) { clientReq in
+            if let buffer = bodyBuffer {
+                clientReq.body = .init(buffer: buffer)
+            }
+        }
+        
+        // Return the response from NaraServer
+        return Response(
+            status: response.status,
+            headers: response.headers,
+            body: .init(buffer: response.body ?? ByteBuffer())
+        )
+    }
+}
+
+// --- NaraServer Integration ---
+func forwardToNaraServer(_ webhookEvent: FacebookWebhookEvent, req: Request, naraServerUrl: String, naraServerApiKey: String) async throws {
+    let uri = URI(string: "\(naraServerUrl)/webhook/facebook")
+    var headers = HTTPHeaders()
+    headers.add(name: .contentType, value: "application/json")
+    headers.add(name: .authorization, value: "Bearer \(naraServerApiKey)")
+    
+    let maxRetries = 3
+    let timeoutSeconds: Int64 = 30
+    var lastError: (any Error)?
+    
+    for attempt in 1...maxRetries {
+        do {
+            // Create a timeout task
+            let timeoutTask = Task {
+                try await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * 1_000_000_000)
+                throw Abort(.requestTimeout, reason: "Request to NaraServer timed out after \(timeoutSeconds) seconds")
+            }
+            
+            // Create the request task
+            let requestTask = Task {
+                try await req.client.post(uri, headers: headers) { clientReq in
+                    try clientReq.content.encode(webhookEvent)
+                }
+            }
+            
+            // Race between timeout and request
+            let response = try await withTaskCancellationHandler {
+                try await requestTask.value
+            } onCancel: {
+                timeoutTask.cancel()
+                requestTask.cancel()
+            }
+            
+            // Cancel the timeout task if request succeeded
+            timeoutTask.cancel()
+            
+            guard response.status == .ok else {
+                let error = Abort(.internalServerError, reason: "NaraServer returned status: \(response.status)")
+                lastError = error
+                
+                if attempt < maxRetries {
+                    req.logger.warning("Failed to forward to NaraServer (attempt \(attempt)/\(maxRetries)): \(response.status)")
+                    // Exponential backoff
+                    try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
+                    continue
+                }
+                
+                throw error
+            }
+            
+            req.logger.info("✅ Successfully forwarded webhook to NaraServer (attempt \(attempt)/\(maxRetries))")
+            return
+            
+        } catch {
+            lastError = error
+            
+            if attempt < maxRetries {
+                req.logger.warning("Failed to forward to NaraServer (attempt \(attempt)/\(maxRetries)): \(error)")
+                // Exponential backoff
+                try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
+                continue
+            }
+        }
+    }
+    
+    req.logger.error("Failed to forward to NaraServer after \(maxRetries) attempts")
+    throw lastError ?? Abort(.internalServerError, reason: "Failed to forward webhook to NaraServer")
 }
 
 // --- Helper Functions ---
@@ -191,7 +370,6 @@ func handleMessage(_ message: FacebookMessageContent, senderId: String, timestam
     let messageData = AppMessageData(type: "new_message", appMessage: appMsg, timestamp: timestamp)
 
     await sseManager.broadcast(data: messageData)
-    await processMessageForOrders(appMsg, req: req, sseManager: sseManager)
 }
 
 func handlePostback(_ postback: FacebookPostback, senderId: String, req: Request, sseManager: SSEManager) async {
@@ -220,26 +398,6 @@ func getSenderInfo(senderId: String, req: Request, pageAccessToken: String) asyn
         return SenderInfo(firstName: "Unknown", lastName: "User")
     }
 }
-
-
-func processMessageForOrders(_ message: AppMessage, req: Request, sseManager: SSEManager) async {
-    let orderKeywords = ["สั่ง", "ขอ", "order", "buy", "purchase"] // Ensure your keywords match expected input
-    let hasOrderKeyword = orderKeywords.contains { keyword in
-        message.text.lowercased().contains(keyword.lowercased())
-    }
-
-    if hasOrderKeyword {
-        req.logger.info("🛒 Potential order detected in message: \(message.text)")
-        
-        let orderEvent = AppMessageData(
-            type: "potential_order",
-            appMessage: message, // Assuming 'message' here is of type AppMessage
-            timestamp: Date()
-        )
-        await sseManager.broadcast(data: orderEvent)
-    }
-}
-
 
 struct FacebookSignatureMiddleware: AsyncMiddleware {
     let appSecret: String

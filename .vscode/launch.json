@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:FacebookWebhookRelay}",
+            "name": "Debug FacebookWebhookRelay",
+            "program": "${workspaceFolder:FacebookWebhookRelay}/.build/debug/FacebookWebhookRelay",
+            "preLaunchTask": "swift: Build Debug FacebookWebhookRelay"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:FacebookWebhookRelay}",
+            "name": "Release FacebookWebhookRelay",
+            "program": "${workspaceFolder:FacebookWebhookRelay}/.build/release/FacebookWebhookRelay",
+            "preLaunchTask": "swift: Build Release FacebookWebhookRelay"
+        }
+    ]
+}

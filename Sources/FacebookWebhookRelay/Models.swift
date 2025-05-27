@@ -45,13 +45,13 @@ struct FacebookPostback: Content {
 
 // --- Structures for SSE and your app ---
 struct AppMessageData: Content {
-    let type: String // e.g., "new_message", "postback", "potential_order"
+    let type: String // e.g., "new_message", "postback"
     let message: AppMessage?
     let postbackPayload: String?
     let senderId: String? // This will be derived from message or provided for postback
     let timestamp: String
 
-    // Initializer for events that include an AppMessage (like new_message, potential_order)
+    // Initializer for events that include an AppMessage (like new_message)
     init(type: String, appMessage: AppMessage, timestamp: Date = Date()) {
         self.type = type
         self.message = appMessage
@@ -98,6 +98,7 @@ struct HealthStatus: Content {
     let status: String
     let timestamp: String
     let connections: Int
+    let serverConnected: Bool
 }
 
 // Helper for Date to ISO8601 String
@@ -105,5 +106,64 @@ extension Date {
     var iso8601: String {
         let formatter = ISO8601DateFormatter()
         return formatter.string(from: self)
+    }
+}
+
+// --- Server Communication Models ---
+struct ServerMessage: Codable {
+    let type: String // "orderChange", "customerChange", etc.
+    let entityId: String
+    let action: String
+    let timestamp: String
+    let data: [String: AnyCodable]? // Dynamic data structure
+}
+
+// Helper struct for handling dynamic JSON
+struct AnyCodable: Codable {
+    let value: Any
+    
+    init(_ value: Any) {
+        self.value = value
+    }
+    
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        
+        if let bool = try? container.decode(Bool.self) {
+            value = bool
+        } else if let int = try? container.decode(Int.self) {
+            value = int
+        } else if let double = try? container.decode(Double.self) {
+            value = double
+        } else if let string = try? container.decode(String.self) {
+            value = string
+        } else if let array = try? container.decode([AnyCodable].self) {
+            value = array.map { $0.value }
+        } else if let dictionary = try? container.decode([String: AnyCodable].self) {
+            value = dictionary.mapValues { $0.value }
+        } else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "AnyCodable cannot decode value")
+        }
+    }
+    
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        
+        switch value {
+        case let bool as Bool:
+            try container.encode(bool)
+        case let int as Int:
+            try container.encode(int)
+        case let double as Double:
+            try container.encode(double)
+        case let string as String:
+            try container.encode(string)
+        case let array as [Any]:
+            try container.encode(array.map { AnyCodable($0) })
+        case let dictionary as [String: Any]:
+            try container.encode(dictionary.mapValues { AnyCodable($0) })
+        default:
+            throw EncodingError.invalidValue(value, EncodingError.Context(codingPath: [], debugDescription: "AnyCodable cannot encode value"))
+        }
     }
 }
