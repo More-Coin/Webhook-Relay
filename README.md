@@ -102,6 +102,52 @@ Or use Docker Compose:
 docker compose up
 ```
 
+## Quick Testing Guide
+
+For isolated testing without real Facebook/NaraServer connections:
+
+### 1. Create Test Environment
+```bash
+# Create .env file with test values
+cat > .env << 'EOF'
+VERIFY_TOKEN=test_verify_token_12345
+APP_SECRET=test_app_secret_67890
+PAGE_ACCESS_TOKEN=test_page_access_token_abcdef
+NARA_SERVER_URL=http://localhost:8081
+NARA_SERVER_API_KEY=test_api_key_xyz123
+RELAY_MODE=forward
+EOF
+```
+
+### 2. Build and Run with Docker
+```bash
+# Build the image
+docker compose build
+
+# Run the container
+docker compose up app
+```
+
+### 3. Test the Endpoints
+```bash
+# Test health check
+curl http://localhost:8080/health
+
+# Test webhook verification
+curl "http://localhost:8080/webhook?hub.mode=subscribe&hub.verify_token=test_verify_token_12345&hub.challenge=test123"
+
+# Test webhook with valid signature
+PAYLOAD='{"object":"page","entry":[{"id":"123","time":1234567890,"messaging":[{"sender":{"id":"123"},"recipient":{"id":"456"},"timestamp":1234567890000,"message":{"mid":"mid.123","text":"Test"}}]}]}'
+SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "test_app_secret_67890" | cut -d' ' -f2)"
+
+curl -X POST http://localhost:8080/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Hub-Signature-256: $SIGNATURE" \
+  -d "$PAYLOAD"
+```
+
+For comprehensive testing instructions, see the [Webhook Relay Testing Guide](Documentation/WebhookRelayTestingGuide.md).
+
 ## SSE Event Format
 
 The relay broadcasts events in the following format:
@@ -218,6 +264,8 @@ swift test
 All documentation is organized in the `Documentation/` folder:
 
 - **[Firebase Setup Guide](Documentation/FIREBASE_SETUP.md)** - Complete guide for setting up Firebase integration
+- **[Firebase Integration Guide](Documentation/FirebaseIntegrationGuide.md)** - Developer-focused Firebase guide
+- **[Webhook Relay Testing Guide](Documentation/WebhookRelayTestingGuide.md)** - Comprehensive testing procedures
 - **[Task List](Documentation/TaskList.md)** - Original integration task list
 - **[Firebase Task List](Documentation/TaskListFirebase.md)** - Firebase-specific implementation tasks and progress
 

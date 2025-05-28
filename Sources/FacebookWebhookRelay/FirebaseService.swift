@@ -1,5 +1,7 @@
 import Vapor
+#if canImport(FirebaseCore)
 import FirebaseCore
+#endif
 
 /// Error categories for structured logging
 enum ErrorCategory: String {
@@ -24,10 +26,15 @@ actor FirebaseService {
             return
         }
         
+        #if canImport(FirebaseCore)
         // Configure Firebase
         FirebaseApp.configure(options: config.options)
         isConfigured = true
         logger.info("✅ Firebase configured successfully")
+        #else
+        logger.warning("⚠️ Firebase not available on Linux - using local logging only")
+        isConfigured = true
+        #endif
     }
     
     /// Log an analytics event
@@ -195,6 +202,7 @@ actor FirebaseService {
 
 /// Firebase configuration structure
 struct FirebaseConfiguration {
+    #if canImport(FirebaseCore)
     let options: FirebaseOptions
     
     init(
@@ -220,6 +228,20 @@ struct FirebaseConfiguration {
             options.setValue(measurementId, forKey: "measurementID")
         }
     }
+    #else
+    // Dummy implementation for Linux
+    init(
+        apiKey: String,
+        authDomain: String,
+        projectId: String,
+        storageBucket: String,
+        messagingSenderId: String,
+        appId: String,
+        measurementId: String? = nil
+    ) {
+        // No-op on Linux
+    }
+    #endif
     
     /// Create configuration from environment variables
     static func fromEnvironment() throws -> FirebaseConfiguration {

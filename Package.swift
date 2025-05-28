@@ -11,8 +11,6 @@ let package = Package(
         .package(url: "https://github.com/vapor/vapor.git", from: "4.115.0"),
         // 🔵 Non-blocking, event-driven networking for Swift. Used for custom executors
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
-        // 🔥 Firebase iOS SDK for Analytics and other services
-        .package(url: "https://github.com/firebase/firebase-ios-sdk.git", from: "11.0.0"),
     ],
     targets: [
         .executableTarget(
@@ -21,7 +19,6 @@ let package = Package(
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
-                .product(name: "FirebaseCore", package: "firebase-ios-sdk"),
             ],
             swiftSettings: swiftSettings
         ),
@@ -39,3 +36,13 @@ let package = Package(
 var swiftSettings: [SwiftSetting] { [
     .enableUpcomingFeature("ExistentialAny"),
 ] }
+
+// Add Firebase only for Apple platforms
+#if os(macOS) || os(iOS)
+package.dependencies.append(
+    .package(url: "https://github.com/firebase/firebase-ios-sdk.git", from: "11.0.0")
+)
+package.targets[0].dependencies.append(
+    .product(name: "FirebaseCore", package: "firebase-ios-sdk")
+)
+#endif

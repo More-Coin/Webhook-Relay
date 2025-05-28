@@ -17,6 +17,13 @@ This folder contains all the documentation for the Facebook Webhook Relay projec
   - Event tracking reference
   - Code examples and best practices
 
+- **[WebhookRelayTestingGuide.md](WebhookRelayTestingGuide.md)** - Comprehensive testing guide
+  - Step-by-step Docker setup
+  - Component testing procedures
+  - Performance and load testing
+  - Automated testing scripts
+  - Troubleshooting common issues
+
 ### Task Lists and Progress Tracking
 - **[TaskList.md](TaskList.md)** - Original Swift/Vapor webhook relay integration task list
   - Complete roadmap for webhook relay development
@@ -41,6 +48,11 @@ This folder contains all the documentation for the Facebook Webhook Relay projec
   - Understanding test results
   - Troubleshooting tips
   - Quick reference cheat sheet
+
+- **[WebhookRelayTestingGuide.md](WebhookRelayTestingGuide.md)** - Testing in isolation guide
+  - Complete Docker testing workflow
+  - Manual testing procedures
+  - Real-world testing scenarios
 
 ## Quick Links
 
