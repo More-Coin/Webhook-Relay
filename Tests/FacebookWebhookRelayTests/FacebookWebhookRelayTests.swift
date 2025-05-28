@@ -2,15 +2,9 @@
 import VaporTesting
 import Testing
 
-@Suite("App Tests")
-struct FacebookWebhookRelayTests {
-    @Test("Test Hello World Route")
-    func helloWorld() async throws {
-        try await withApp(configure: configure) { app in
-            try await app.testing().test(.GET, "hello", afterResponse: { res async in
-                #expect(res.status == .ok)
-                #expect(res.body.string == "Hello, world!")
-            })
-        }
-    }
-}
+// Main test file - all specific tests are in separate files:
+// - FacebookSignatureMiddlewareTests.swift
+// - SSEManagerTests.swift  
+// - FirebaseServiceTests.swift
+// - WebhookIntegrationTests.swift
+// - RateLimiterTests.swift

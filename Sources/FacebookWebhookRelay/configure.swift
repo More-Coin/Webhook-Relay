@@ -1,6 +1,9 @@
 import Vapor
 
 public func configure(_ app: Application) async throws {
+    // Initialize Firebase if configuration is available (optional)
+    // Firebase configuration will be handled in routes.swift where the types are available
+    
     // Increase body collection limit if you expect large payloads,
     // though Facebook webhooks are usually small. Default is 16KB.
     app.routes.defaultMaxBodySize = "10mb"
@@ -33,5 +36,16 @@ public func configure(_ app: Application) async throws {
     try routes(app)
 
     // Set port from environment or default
-    app.http.server.configuration.port = Int(Environment.get("PORT") ?? "8080") ?? 8080
+    let port = Int(Environment.get("PORT") ?? "8080") ?? 8080
+    app.http.server.configuration.port = port
+    
+    // Log relay started event if Firebase is configured
+    let relayMode = Environment.get("RELAY_MODE") ?? "forward"
+    Task {
+        if let firebaseConfig = try? FirebaseConfiguration.fromEnvironment() {
+            let service = FirebaseService()
+            await service.configure(with: firebaseConfig)
+            await service.logRelayStarted(port: port, mode: relayMode)
+        }
+    }
 }

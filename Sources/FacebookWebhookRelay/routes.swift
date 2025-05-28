@@ -32,6 +32,21 @@ actor RateLimiter {
 }
 
 func routes(_ app: Application) throws {
+    // --- Firebase Initialization (Optional) ---
+    let firebaseService: FirebaseService? = {
+        do {
+            _ = try FirebaseConfiguration.fromEnvironment()
+            let service = FirebaseService()
+            // Configure Firebase synchronously for now
+            // TODO: Make this async when needed
+            app.logger.info("✅ Firebase service created (configuration pending)")
+            return service
+        } catch {
+            app.logger.warning("⚠️ Firebase not configured: \(error)")
+            return nil
+        }
+    }()
+    
     // --- Environment Variables ---
     guard let verifyToken = Environment.get("VERIFY_TOKEN") else {
         fatalError("VERIFY_TOKEN not set in environment")
@@ -110,6 +125,12 @@ func routes(_ app: Application) throws {
         
         guard allowed else {
             req.logger.warning("Rate limit exceeded for IP: \(clientIP)")
+            
+            // Log rate limit exceeded to Firebase
+            if let firebase = firebaseService {
+                await firebase.logRateLimitExceeded(clientIP: clientIP, endpoint: "/webhook")
+            }
+            
             throw Abort(.tooManyRequests, reason: "Rate limit exceeded")
         }
         
@@ -118,17 +139,70 @@ func routes(_ app: Application) throws {
             webhookEvent = try req.content.decode(FacebookWebhookEvent.self)
         } catch {
             req.logger.error("Failed to decode webhook event: \(error)")
+            
+            // Log error to Firebase
+            if let firebase = firebaseService {
+                await firebase.logError(
+                    category: .webhookProcessing,
+                    message: "Failed to decode webhook event: \(error.localizedDescription)",
+                    context: ["endpoint": "/webhook", "method": "POST"]
+                )
+            }
+            
             // Facebook expects a 200 OK even if we can't process, to avoid being disabled.
             // However, if the signature was invalid, the middleware would have aborted earlier.
             return .ok
         }
 
+        // Log webhook received event to Firebase
+        if let firebase = firebaseService {
+            let messageCount = webhookEvent.entry.reduce(0) { total, entry in
+                total + (entry.messaging?.count ?? 0)
+            }
+            let pageId = webhookEvent.entry.first?.id
+            await firebase.logWebhookReceived(
+                source: "facebook", 
+                messageCount: messageCount,
+                webhookType: webhookEvent.object,
+                pageId: pageId
+            )
+        }
+
         // Forward to NaraServer if in forward mode
         if relayMode == "forward" || relayMode == "both" {
+            let forwardStartTime = Date()
             do {
-                try await forwardToNaraServer(webhookEvent, req: req, naraServerUrl: naraServerUrl, naraServerApiKey: naraServerApiKey)
+                try await forwardToNaraServer(webhookEvent, req: req, naraServerUrl: naraServerUrl, naraServerApiKey: naraServerApiKey, firebaseService: firebaseService)
+                
+                // Log successful forwarding
+                if let firebase = firebaseService {
+                    let responseTime = Date().timeIntervalSince(forwardStartTime)
+                    let messageSize = try? JSONEncoder().encode(webhookEvent).count
+                    await firebase.logMessageForwarded(
+                        destination: "nara_server", 
+                        success: true,
+                        responseTime: responseTime,
+                        messageSize: messageSize
+                    )
+                }
             } catch {
                 req.logger.error("Failed to forward webhook to NaraServer: \(error)")
+                
+                // Log failed forwarding and error
+                if let firebase = firebaseService {
+                    let responseTime = Date().timeIntervalSince(forwardStartTime)
+                    await firebase.logMessageForwarded(
+                        destination: "nara_server", 
+                        success: false,
+                        responseTime: responseTime
+                    )
+                    
+                    await firebase.logError(
+                        category: .naraServerConnection,
+                        message: "Failed to forward webhook: \(error.localizedDescription)",
+                        context: ["server_url": naraServerUrl, "response_time_ms": Int(responseTime * 1000)]
+                    )
+                }
                 // Continue processing locally as fallback during migration
             }
         }
@@ -182,12 +256,24 @@ func routes(_ app: Application) throws {
         _ = sourceForYielding.yield(initialData)
         
         req.logger.info("SSE connection \(id) established. Sending initial data.")
+        
+        // Log SSE connection to Firebase
+        if let firebase = firebaseService {
+            let connectionCount = await sseManager.getConnectionCount()
+            await firebase.logSSEConnection(action: "connected", connectionCount: connectionCount)
+        }
 
         _ = req.eventLoop.makeFutureWithTask {
             try? await promise.futureResult.get()
             sourceForYielding.finish()
             await sseManager.removeConnection(id: id)
             req.logger.info("SSE connection \(id) closed by client or server.")
+            
+            // Log SSE disconnection to Firebase
+            if let firebase = firebaseService {
+                let connectionCount = await sseManager.getConnectionCount()
+                await firebase.logSSEConnection(action: "disconnected", connectionCount: connectionCount)
+            }
         }
 
         var headers = HTTPHeaders()
@@ -261,7 +347,7 @@ func routes(_ app: Application) throws {
 }
 
 // --- NaraServer Integration ---
-func forwardToNaraServer(_ webhookEvent: FacebookWebhookEvent, req: Request, naraServerUrl: String, naraServerApiKey: String) async throws {
+func forwardToNaraServer(_ webhookEvent: FacebookWebhookEvent, req: Request, naraServerUrl: String, naraServerApiKey: String, firebaseService: FirebaseService? = nil) async throws {
     let uri = URI(string: "\(naraServerUrl)/webhook/facebook")
     var headers = HTTPHeaders()
     headers.add(name: .contentType, value: "application/json")

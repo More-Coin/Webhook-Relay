@@ -19,6 +19,9 @@ This relay service acts as a bridge between:
 - ✅ Health monitoring with connection status
 - ✅ Message sending proxy endpoint
 - ✅ Configurable relay modes (forward/process/both)
+- ✅ Firebase integration with structured logging
+- ✅ Comprehensive error tracking and monitoring
+- ✅ Performance metrics tracking
 
 ## Environment Variables
 
@@ -37,6 +40,15 @@ NARA_SERVER_WS_URL=wss://your-server.com/live  # WebSocket URL (auto-derived if 
 RELAY_DEVICE_ID=webhook_relay_1                # Unique identifier for this relay instance
 RELAY_MODE=forward                             # Relay mode: forward, process, or both
 PORT=8080                                      # Server port
+
+# Firebase Configuration (Optional - for analytics)
+FIREBASE_API_KEY=your_firebase_api_key         # Firebase API key
+FIREBASE_AUTH_DOMAIN=your-project.firebaseapp.com  # Firebase auth domain
+FIREBASE_PROJECT_ID=your-project-id           # Firebase project ID
+FIREBASE_STORAGE_BUCKET=your-project.appspot.com  # Firebase storage bucket
+FIREBASE_MESSAGING_SENDER_ID=123456789        # Firebase messaging sender ID
+FIREBASE_APP_ID=1:123456789:web:abcdef123456   # Firebase app ID
+FIREBASE_MEASUREMENT_ID=G-XXXXXXXXXX          # Firebase measurement ID (for Analytics)
 ```
 
 ## Relay Modes
@@ -62,7 +74,7 @@ PORT=8080                                      # Server port
 
 1. Install Swift 6.0+
 2. Clone the repository
-3. Set environment variables in `.env` file
+3. Set environment variables in `.env` file (see [Firebase Setup Guide](Documentation/FIREBASE_SETUP.md) for Firebase configuration)
 4. Run the development server:
    ```bash
    swift run
@@ -125,6 +137,32 @@ The relay broadcasts events in the following format:
 }
 ```
 
+## Firebase Analytics Events
+
+The relay tracks the following events (logged locally as Firebase Analytics is not available server-side):
+
+### Core Events
+- **webhook_received** - When a Facebook webhook is received
+  - Parameters: source, message_count, webhook_type, page_id
+- **message_forwarded** - When a message is forwarded to NaraServer
+  - Parameters: destination, success, response_time_ms, message_size_bytes
+- **sse_connection** - When SSE clients connect/disconnect
+  - Parameters: action, connection_count, client_info, connection_duration_seconds
+- **server_connection** - WebSocket connection status changes
+  - Parameters: connected, server, reconnection_count, latency_ms
+
+### Operational Events
+- **relay_started** - When the relay server starts
+  - Parameters: port, mode, version
+- **relay_shutdown** - When the relay server shuts down
+  - Parameters: reason (if available)
+- **error_occurred** - When errors occur
+  - Parameters: category, message, stack_trace, context
+- **api_proxy_request** - When proxy endpoints are used
+  - Parameters: endpoint, method, success, response_time_ms
+- **rate_limit_exceeded** - When rate limits are hit
+  - Parameters: client_ip, endpoint
+
 ## Security
 
 - All Facebook webhooks are verified using HMAC-SHA256 signatures
@@ -173,6 +211,15 @@ swift test
   - `Models.swift` - Data structures
   - `SSEManager.swift` - SSE connection management
   - `NaraServerConnection.swift` - WebSocket client
+  - `FirebaseService.swift` - Firebase integration
+
+## Documentation
+
+All documentation is organized in the `Documentation/` folder:
+
+- **[Firebase Setup Guide](Documentation/FIREBASE_SETUP.md)** - Complete guide for setting up Firebase integration
+- **[Task List](Documentation/TaskList.md)** - Original integration task list
+- **[Firebase Task List](Documentation/TaskListFirebase.md)** - Firebase-specific implementation tasks and progress
 
 ## License
 
