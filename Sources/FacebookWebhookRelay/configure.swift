@@ -41,11 +41,21 @@ public func configure(_ app: Application) async throws {
     
     // Log relay started event if Firebase is configured
     let relayMode = Environment.get("RELAY_MODE") ?? "forward"
+    
+    // Firebase disabled for now due to configuration issues
+    // TODO: Re-enable Firebase once proper credentials are available
+    app.logger.info("⚠️ Firebase disabled - using local logging only")
+    
+    /*
     Task {
-        if let firebaseConfig = try? FirebaseConfiguration.fromEnvironment() {
+        do {
+            let firebaseConfig = try FirebaseConfiguration.fromEnvironment()
             let service = FirebaseService()
             await service.configure(with: firebaseConfig)
             await service.logRelayStarted(port: port, mode: relayMode)
+        } catch {
+            app.logger.warning("⚠️ Firebase configuration failed, continuing without Firebase: \(error)")
         }
     }
+    */
 }

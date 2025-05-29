@@ -32,7 +32,10 @@ actor RateLimiter {
 }
 
 func routes(_ app: Application) throws {
-    // --- Firebase Initialization (Optional) ---
+    // --- Firebase Initialization (Disabled for now) ---
+    let firebaseService: FirebaseService? = nil
+    
+    /*
     let firebaseService: FirebaseService? = {
         do {
             _ = try FirebaseConfiguration.fromEnvironment()
@@ -46,6 +49,7 @@ func routes(_ app: Application) throws {
             return nil
         }
     }()
+    */
     
     // --- Environment Variables ---
     guard let verifyToken = Environment.get("VERIFY_TOKEN") else {
@@ -317,8 +321,10 @@ func routes(_ app: Application) throws {
         )
     }
     
-    // --- Message Sending Proxy ---
+    // --- Message Sending Proxy (Updated for Callback Pattern) ---
     app.post("api", "facebook", "send") { req async throws -> Response in
+        req.logger.info("📤 Received message send request")
+        
         // Verify authentication if needed
         // For now, we'll just forward the request
         
@@ -327,22 +333,59 @@ func routes(_ app: Application) throws {
         headers.add(name: .contentType, value: "application/json")
         headers.add(name: .authorization, value: "Bearer \(naraServerApiKey)")
         
+        // Add callback URL so NaraServer knows where to send the processed message
+        headers.add(name: "X-Callback-URL", value: "http://localhost:8080/callback/facebook/send")
+        
         // Collect the request body
         let bodyBuffer = try await req.body.collect(max: 10 * 1024 * 1024).get() // 10MB max
         
-        // Forward the request body
+        // Forward the request body to NaraServer
         let response = try await req.client.post(uri, headers: headers) { clientReq in
             if let buffer = bodyBuffer {
                 clientReq.body = .init(buffer: buffer)
             }
         }
         
-        // Return the response from NaraServer
+        req.logger.info("📨 Forwarded message to NaraServer, status: \(response.status)")
+        
+        // Return the response from NaraServer (might be an acknowledgment)
         return Response(
             status: response.status,
             headers: response.headers,
             body: .init(buffer: response.body ?? ByteBuffer())
         )
+    }
+    
+    // --- Callback Endpoint for NaraServer to Send Processed Messages ---
+    app.post("callback", "facebook", "send") { req async throws -> HTTPStatus in
+        req.logger.info("📥 Received callback from NaraServer for message send")
+        
+        // Verify this is from NaraServer (basic auth check)
+        guard let authHeader = req.headers.first(name: .authorization),
+              authHeader == "Bearer \(naraServerApiKey)" else {
+            req.logger.warning("❌ Unauthorized callback request")
+            throw Abort(.unauthorized, reason: "Invalid authorization")
+        }
+        
+        // Decode the message that NaraServer wants us to send to Facebook
+        let messageRequest: FacebookSendMessageRequest
+        do {
+            messageRequest = try req.content.decode(FacebookSendMessageRequest.self)
+            req.logger.info("📝 Decoded message: \(messageRequest.message.text ?? "No text")")
+        } catch {
+            req.logger.error("❌ Failed to decode callback message: \(error)")
+            throw Abort(.badRequest, reason: "Invalid message format")
+        }
+        
+        // Send the message to Facebook using our Page Access Token
+        do {
+            try await sendMessageToFacebook(messageRequest, pageAccessToken: pageAccessToken, req: req)
+            req.logger.info("✅ Successfully sent message to Facebook")
+            return .ok
+        } catch {
+            req.logger.error("❌ Failed to send message to Facebook: \(error)")
+            throw Abort(.internalServerError, reason: "Failed to send to Facebook")
+        }
     }
 }
 
@@ -525,4 +568,67 @@ struct FacebookSignatureMiddleware: AsyncMiddleware {
             throw Abort(.unauthorized, reason: "Invalid signature.")
         }
     }
+}
+
+// --- Facebook API Integration ---
+func sendMessageToFacebook(_ messageRequest: FacebookSendMessageRequest, pageAccessToken: String, req: Request) async throws {
+    let pageId = "597164376811779" // Your page ID - should come from environment in production
+    let uri = URI(string: "https://graph.facebook.com/v19.0/\(pageId)/messages")
+    
+    var headers = HTTPHeaders()
+    headers.add(name: .contentType, value: "application/json")
+    headers.add(name: .accept, value: "application/json")
+    
+    // Prepare the Facebook API request
+    var facebookRequest: [String: Any] = [
+        "recipient": ["id": messageRequest.recipient.id],
+        "message": [:],
+        "access_token": pageAccessToken
+    ]
+    
+    // Add message content
+    var messageContent: [String: Any] = [:]
+    if let text = messageRequest.message.text {
+        messageContent["text"] = text
+    }
+    
+    if let attachment = messageRequest.message.attachment {
+        messageContent["attachment"] = [
+            "type": attachment.type,
+            "payload": [
+                "url": attachment.payload.url ?? "",
+                "template_type": attachment.payload.templateType ?? ""
+            ]
+        ]
+    }
+    
+    facebookRequest["message"] = messageContent
+    
+    // Add messaging type if specified
+    if let messagingType = messageRequest.messagingType {
+        facebookRequest["messaging_type"] = messagingType
+    }
+    
+    // Add tag if specified
+    if let tag = messageRequest.tag {
+        facebookRequest["tag"] = tag
+    }
+    
+    req.logger.info("🌐 Sending message to Facebook API: \(uri)")
+    
+    // Convert to Data for the request
+    let jsonData = try JSONSerialization.data(withJSONObject: facebookRequest)
+    
+    // Send the request to Facebook
+    let response = try await req.client.post(uri, headers: headers) { clientReq in
+        clientReq.body = .init(data: jsonData)
+    }
+    
+    guard response.status.code >= 200 && response.status.code < 300 else {
+        let errorBody = response.body?.getString(at: 0, length: response.body?.readableBytes ?? 0) ?? "No error details"
+        req.logger.error("❌ Facebook API error (\(response.status)): \(errorBody)")
+        throw Abort(.internalServerError, reason: "Facebook API error: \(response.status)")
+    }
+    
+    req.logger.info("✅ Message sent to Facebook successfully")
 }

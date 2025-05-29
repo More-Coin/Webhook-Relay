@@ -167,3 +167,31 @@ struct AnyCodable: Codable {
         }
     }
 }
+
+// --- Facebook Send Message Structures ---
+struct FacebookSendMessageRequest: Content {
+    let recipient: FacebookRecipient
+    let message: FacebookMessageToSend
+    let messagingType: String? // "RESPONSE", "UPDATE", "MESSAGE_TAG"
+    let tag: String? // For message tags
+}
+
+struct FacebookRecipient: Content {
+    let id: String // PSID of the recipient
+}
+
+struct FacebookMessageToSend: Content {
+    let text: String?
+    let attachment: FacebookAttachment? // For sending images, etc.
+}
+
+struct FacebookAttachment: Content {
+    let type: String // "image", "video", "file", "template"
+    let payload: FacebookAttachmentPayload
+}
+
+struct FacebookAttachmentPayload: Content {
+    let url: String? // For media attachments
+    let templateType: String? // For template attachments
+    // Add more fields as needed
+}

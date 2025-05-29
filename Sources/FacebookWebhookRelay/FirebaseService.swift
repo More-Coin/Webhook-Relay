@@ -27,10 +27,15 @@ actor FirebaseService {
         }
         
         #if canImport(FirebaseCore)
-        // Configure Firebase
-        FirebaseApp.configure(options: config.options)
-        isConfigured = true
-        logger.info("✅ Firebase configured successfully")
+        do {
+            // Configure Firebase
+            FirebaseApp.configure(options: config.options)
+            isConfigured = true
+            logger.info("✅ Firebase configured successfully")
+        } catch {
+            logger.warning("⚠️ Firebase configuration failed: \(error). Continuing with local logging only.")
+            isConfigured = false
+        }
         #else
         logger.warning("⚠️ Firebase not available on Linux - using local logging only")
         isConfigured = true
@@ -223,10 +228,8 @@ struct FirebaseConfiguration {
         options.projectID = projectId
         options.storageBucket = storageBucket
         
-        if let measurementId = measurementId {
-            // Set measurement ID for Analytics
-            options.setValue(measurementId, forKey: "measurementID")
-        }
+        // Note: measurementId is not needed for server-side Firebase configuration
+        // and is not a valid property on FirebaseOptions
     }
     #else
     // Dummy implementation for Linux

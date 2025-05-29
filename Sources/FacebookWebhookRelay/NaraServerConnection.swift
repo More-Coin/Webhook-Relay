@@ -44,8 +44,30 @@ actor NaraServerConnection {
                     headers: headers,
                     on: app.eventLoopGroup.next()
                 ) { [weak self] ws in
-                    Task {
-                        await self?.handleWebSocketConnection(ws)
+                    // Set up callbacks synchronously on the WebSocket's event loop
+                    Task { [weak self] in
+                        await self?.storeWebSocket(ws)
+                    }
+                    
+                    // Handle incoming messages
+                    ws.onText { [weak self] ws, text in
+                        Task {
+                            await self?.handleServerMessage(text)
+                        }
+                    }
+                    
+                    // Handle binary messages if needed
+                    ws.onBinary { [weak self] ws, buffer in
+                        Task {
+                            await self?.logger.debug("Received binary message from NaraServer (ignored)")
+                        }
+                    }
+                    
+                    // Handle close
+                    ws.onClose.whenComplete { [weak self] _ in
+                        Task {
+                            await self?.handleDisconnection()
+                        }
                     }
                 }
             }.get()
@@ -55,31 +77,12 @@ actor NaraServerConnection {
         }
     }
     
-    private func handleWebSocketConnection(_ ws: WebSocket) async {
+    private func storeWebSocket(_ ws: WebSocket) async {
         self.ws = ws
         self.logger.info("✅ Connected to NaraServer WebSocket")
         
         // Send initial connection message
         await self.sendConnectionMessage()
-        
-        // Handle incoming messages
-        ws.onText { [weak self] ws, text in
-            Task {
-                await self?.handleServerMessage(text)
-            }
-        }
-        
-        // Handle binary messages if needed
-        ws.onBinary { [weak self] ws, buffer in
-            self?.logger.debug("Received binary message from NaraServer (ignored)")
-        }
-        
-        // Handle close
-        ws.onClose.whenComplete { [weak self] _ in
-            Task {
-                await self?.handleDisconnection()
-            }
-        }
     }
     
     private func sendConnectionMessage() async {
