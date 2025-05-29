@@ -195,3 +195,22 @@ struct FacebookAttachmentPayload: Content {
     let templateType: String? // For template attachments
     // Add more fields as needed
 }
+
+// --- Flattened Message Request Structure (for your app/server) ---
+struct FlattenedMessageRequest: Content {
+    let recipientPSID: String
+    let text: String
+    let conversationId: String?
+    let messagingType: String? // "RESPONSE", "UPDATE", "MESSAGE_TAG"
+    let tag: String? // For message tags
+    
+    // Convert to Facebook API format
+    func toFacebookRequest() -> FacebookSendMessageRequest {
+        return FacebookSendMessageRequest(
+            recipient: FacebookRecipient(id: recipientPSID),
+            message: FacebookMessageToSend(text: text, attachment: nil),
+            messagingType: messagingType,
+            tag: tag
+        )
+    }
+}

@@ -1,0 +1,37 @@
+{
+  "flattenedFormat": {
+    "description": "Test message using flattened format for app/server",
+    "endpoint": "POST /callback/facebook/send",
+    "headers": {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer YOUR_NARA_SERVER_API_KEY"
+    },
+    "body": {
+      "recipientPSID": "test_123456",
+      "text": "#ข้อมูลการสั่งซื้อ\n\nชัยพัทธ์ วรเศรษฐพงษ์\n847 ถ.ริมทางรถไฟ เขตธนบุรี\nแขวงตลาดพลู กทม 10600\n(084-681-3739)\n\nน้ำมันปลา 500mg(50) *2\n#ชำระปลายทาง 384 บาท",
+      "conversationId": "t_chaipat_order_001",
+      "messagingType": "RESPONSE"
+    }
+  },
+  "nestedFormat": {
+    "description": "Test message using nested format (Facebook API style)",
+    "endpoint": "POST /callback/facebook/send",
+    "headers": {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer YOUR_NARA_SERVER_API_KEY"
+    },
+    "body": {
+      "recipient": {
+        "id": "test_123456"
+      },
+      "message": {
+        "text": "#ข้อมูลการสั่งซื้อ\n\nชัยพัทธ์ วรเศรษฐพงษ์\n847 ถ.ริมทางรถไฟ เขตธนบุรี\nแขวงตลาดพลู กทม 10600\n(084-681-3739)\n\nน้ำมันปลา 500mg(50) *2\n#ชำระปลายทาง 384 บาท"
+      },
+      "messagingType": "RESPONSE"
+    }
+  },
+  "realPSIDExample": {
+    "description": "To test with real Facebook, replace test_123456 with actual PSID from webhook logs",
+    "note": "Send a message to your Facebook page first, then check logs for the real PSID"
+  }
+} 

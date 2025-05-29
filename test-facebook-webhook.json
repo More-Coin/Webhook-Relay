@@ -1,0 +1,57 @@
+{
+  "description": "Test message simulating Facebook sending a webhook when someone messages your page",
+  "endpoint": "POST /webhook",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Hub-Signature-256": "sha256=YOUR_CALCULATED_SIGNATURE"
+  },
+  "note": "You'll need to calculate the proper HMAC signature or temporarily disable signature verification for testing",
+  "body": {
+    "object": "page",
+    "entry": [
+      {
+        "id": "597164376811779",
+        "time": 1703123456,
+        "messaging": [
+          {
+            "sender": {
+              "id": "1234567890123456"
+            },
+            "recipient": {
+              "id": "597164376811779"
+            },
+            "timestamp": 1703123456789,
+            "message": {
+              "mid": "m_test_message_001",
+              "text": "#ข้อมูลการสั่งซื้อ\n\nชัยพัทธ์ วรเศรษฐพงษ์\n847 ถ.ริมทางรถไฟ เขตธนบุรี\nแขวงตลาดพลู กทม 10600\n(084-681-3739)\n\nน้ำมันปลา 500mg(50) *2\n#ชำระปลายทาง 384 บาท"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expectedBehavior": {
+    "description": "This should trigger your webhook handler, which will:",
+    "steps": [
+      "1. Verify the signature (if enabled)",
+      "2. Parse the FacebookWebhookEvent",
+      "3. Extract the message and sender PSID",
+      "4. Get sender info from Facebook Graph API",
+      "5. Create AppMessage and broadcast via SSE",
+      "6. Forward to NaraServer (if in forward mode)",
+      "7. Return 200 OK"
+    ]
+  },
+  "testingOptions": {
+    "withoutSignature": {
+      "description": "To test without signature verification, temporarily comment out the FacebookSignatureMiddleware",
+      "headers": {
+        "Content-Type": "application/json"
+      }
+    },
+    "withSignature": {
+      "description": "Calculate HMAC-SHA256 of the body using your APP_SECRET",
+      "example": "Use online tool or code: HMAC-SHA256(body, APP_SECRET)"
+    }
+  }
+} 

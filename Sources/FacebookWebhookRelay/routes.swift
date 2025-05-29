@@ -1,6 +1,7 @@
 import Vapor
 import Crypto // For HMAC
 import NIOCore
+import Foundation // For pow function
 
 // Simple in-memory rate limiter
 actor RateLimiter {
@@ -334,7 +335,8 @@ func routes(_ app: Application) throws {
         headers.add(name: .authorization, value: "Bearer \(naraServerApiKey)")
         
         // Add callback URL so NaraServer knows where to send the processed message
-        headers.add(name: "X-Callback-URL", value: "http://localhost:8080/callback/facebook/send")
+        let callbackUrl = Environment.get("CALLBACK_BASE_URL") ?? "http://localhost:8080"
+        headers.add(name: "X-Callback-URL", value: "\(callbackUrl)/callback/facebook/send")
         
         // Collect the request body
         let bodyBuffer = try await req.body.collect(max: 10 * 1024 * 1024).get() // 10MB max
@@ -367,25 +369,94 @@ func routes(_ app: Application) throws {
             throw Abort(.unauthorized, reason: "Invalid authorization")
         }
         
-        // Decode the message that NaraServer wants us to send to Facebook
+        // Try to decode as flattened format first, then fall back to nested format
         let messageRequest: FacebookSendMessageRequest
         do {
-            messageRequest = try req.content.decode(FacebookSendMessageRequest.self)
-            req.logger.info("📝 Decoded message: \(messageRequest.message.text ?? "No text")")
+            // Try flattened format first
+            let flattenedRequest = try req.content.decode(FlattenedMessageRequest.self)
+            messageRequest = flattenedRequest.toFacebookRequest()
+            req.logger.info("📝 Decoded flattened message for recipient '\(flattenedRequest.recipientPSID)': \(flattenedRequest.text)")
+            req.logger.info("📋 Conversation ID: \(flattenedRequest.conversationId ?? "none")")
         } catch {
-            req.logger.error("❌ Failed to decode callback message: \(error)")
-            throw Abort(.badRequest, reason: "Invalid message format")
+            // Fall back to nested format
+            do {
+                messageRequest = try req.content.decode(FacebookSendMessageRequest.self)
+                req.logger.info("📝 Decoded nested message for recipient '\(messageRequest.recipient.id)': \(messageRequest.message.text ?? "No text")")
+            } catch {
+                req.logger.error("❌ Failed to decode callback message in any format. Flattened error: \(error)")
+                
+                // Log error to Firebase if available
+                if let firebase = firebaseService {
+                    await firebase.logError(
+                        category: .webhookProcessing,
+                        message: "Failed to decode callback message: \(error.localizedDescription)",
+                        context: ["endpoint": "/callback/facebook/send", "method": "POST"]
+                    )
+                }
+                
+                throw Abort(.badRequest, reason: "Invalid message format: \(error.localizedDescription)")
+            }
         }
         
-        // Send the message to Facebook using our Page Access Token
-        do {
-            try await sendMessageToFacebook(messageRequest, pageAccessToken: pageAccessToken, req: req)
-            req.logger.info("✅ Successfully sent message to Facebook")
+        // Add test mode handling
+        if messageRequest.recipient.id == "test" || messageRequest.recipient.id.hasPrefix("test_") {
+            req.logger.info("🧪 Test mode - skipping Facebook API call for recipient: \(messageRequest.recipient.id)")
+            req.logger.info("✅ Would have sent message: '\(messageRequest.message.text ?? "No text")'")
             return .ok
-        } catch {
-            req.logger.error("❌ Failed to send message to Facebook: \(error)")
-            throw Abort(.internalServerError, reason: "Failed to send to Facebook")
         }
+        
+        // Send the message to Facebook with enhanced error handling
+        let maxRetries = 3
+        var lastError: (any Error)?
+        
+        for attempt in 1...maxRetries {
+            do {
+                try await sendMessageToFacebookWithRetry(messageRequest, pageAccessToken: pageAccessToken, req: req, attempt: attempt)
+                req.logger.info("✅ Successfully sent message to Facebook (attempt \(attempt)/\(maxRetries))")
+                
+                // Log successful callback to Firebase
+                if let firebase = firebaseService {
+                    await firebase.logApiProxyRequest(
+                        endpoint: "/callback/facebook/send",
+                        method: "POST",
+                        success: true
+                    )
+                }
+                
+                return .ok
+            } catch {
+                lastError = error
+                req.logger.warning("⚠️ Failed to send message to Facebook (attempt \(attempt)/\(maxRetries)): \(error)")
+                
+                if attempt < maxRetries {
+                    // Exponential backoff: 1s, 2s, 4s
+                    let delayNanoseconds = UInt64(pow(2.0, Double(attempt - 1))) * 1_000_000_000
+                    try await Task.sleep(nanoseconds: delayNanoseconds)
+                } else {
+                    // Log final failure to Firebase
+                    if let firebase = firebaseService {
+                        await firebase.logApiProxyRequest(
+                            endpoint: "/callback/facebook/send",
+                            method: "POST",
+                            success: false
+                        )
+                        
+                        await firebase.logError(
+                            category: .webhookProcessing,
+                            message: "Failed to send message to Facebook after \(maxRetries) attempts: \(error.localizedDescription)",
+                            context: [
+                                "endpoint": "/callback/facebook/send",
+                                "attempts": maxRetries,
+                                "recipient_id": messageRequest.recipient.id
+                            ]
+                        )
+                    }
+                }
+            }
+        }
+        
+        req.logger.error("❌ Failed to send message to Facebook after \(maxRetries) attempts: \(lastError?.localizedDescription ?? "Unknown error")")
+        throw Abort(.internalServerError, reason: "Failed to send to Facebook after \(maxRetries) attempts")
     }
 }
 
@@ -631,4 +702,67 @@ func sendMessageToFacebook(_ messageRequest: FacebookSendMessageRequest, pageAcc
     }
     
     req.logger.info("✅ Message sent to Facebook successfully")
+}
+
+func sendMessageToFacebookWithRetry(_ messageRequest: FacebookSendMessageRequest, pageAccessToken: String, req: Request, attempt: Int) async throws {
+    let maxRetries = 3 // Define maxRetries for this function
+    let pageId = "597164376811779" // Your page ID - should come from environment in production
+    let uri = URI(string: "https://graph.facebook.com/v19.0/\(pageId)/messages")
+    
+    var headers = HTTPHeaders()
+    headers.add(name: .contentType, value: "application/json")
+    headers.add(name: .accept, value: "application/json")
+    
+    // Prepare the Facebook API request
+    var facebookRequest: [String: Any] = [
+        "recipient": ["id": messageRequest.recipient.id],
+        "message": [:],
+        "access_token": pageAccessToken
+    ]
+    
+    // Add message content
+    var messageContent: [String: Any] = [:]
+    if let text = messageRequest.message.text {
+        messageContent["text"] = text
+    }
+    
+    if let attachment = messageRequest.message.attachment {
+        messageContent["attachment"] = [
+            "type": attachment.type,
+            "payload": [
+                "url": attachment.payload.url ?? "",
+                "template_type": attachment.payload.templateType ?? ""
+            ]
+        ]
+    }
+    
+    facebookRequest["message"] = messageContent
+    
+    // Add messaging type if specified
+    if let messagingType = messageRequest.messagingType {
+        facebookRequest["messaging_type"] = messagingType
+    }
+    
+    // Add tag if specified
+    if let tag = messageRequest.tag {
+        facebookRequest["tag"] = tag
+    }
+    
+    req.logger.info("🌐 Sending message to Facebook API: \(uri)")
+    
+    // Convert to Data for the request
+    let jsonData = try JSONSerialization.data(withJSONObject: facebookRequest)
+    
+    // Send the request to Facebook
+    let response = try await req.client.post(uri, headers: headers) { clientReq in
+        clientReq.body = .init(data: jsonData)
+    }
+    
+    guard response.status.code >= 200 && response.status.code < 300 else {
+        let errorBody = response.body?.getString(at: 0, length: response.body?.readableBytes ?? 0) ?? "No error details"
+        req.logger.error("❌ Facebook API error (\(response.status)): \(errorBody)")
+        throw Abort(.internalServerError, reason: "Facebook API error: \(response.status)")
+    }
+    
+    req.logger.info("✅ Message sent to Facebook successfully (attempt \(attempt)/\(maxRetries))")
 }

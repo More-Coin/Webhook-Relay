@@ -39,9 +39,6 @@ public func configure(_ app: Application) async throws {
     let port = Int(Environment.get("PORT") ?? "8080") ?? 8080
     app.http.server.configuration.port = port
     
-    // Log relay started event if Firebase is configured
-    let relayMode = Environment.get("RELAY_MODE") ?? "forward"
-    
     // Firebase disabled for now due to configuration issues
     // TODO: Re-enable Firebase once proper credentials are available
     app.logger.info("⚠️ Firebase disabled - using local logging only")
