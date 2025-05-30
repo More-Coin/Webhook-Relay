@@ -30,18 +30,25 @@ actor NaraServerConnection {
         do {
             logger.info("Connecting to NaraServer WebSocket at \(naraServerWsUrl)")
             
-            let headers = HTTPHeaders([
-                ("Authorization", "Bearer \(naraServerApiKey)"),
-                ("X-Relay-Device-Id", relayDeviceId)
-            ])
+            // Build WebSocket URL with query parameters for authentication
+            var urlComponents = URLComponents(string: naraServerWsUrl)!
+            urlComponents.queryItems = [
+                URLQueryItem(name: "token", value: naraServerApiKey),
+                URLQueryItem(name: "device_id", value: relayDeviceId),
+                URLQueryItem(name: "platform", value: "webhook")
+            ]
             
-            // Capture the URL before the closure
-            let wsUrl = naraServerWsUrl
+            guard let authenticatedUrl = urlComponents.url?.absoluteString else {
+                logger.error("Failed to construct authenticated WebSocket URL")
+                await scheduleReconnect(app: app)
+                return
+            }
+            
+            logger.info("WebSocket URL with auth: \(authenticatedUrl.replacingOccurrences(of: naraServerApiKey, with: "***TOKEN***"))")
             
             try await app.eventLoopGroup.any().makeFutureWithTask {
                 try await WebSocket.connect(
-                    to: wsUrl,
-                    headers: headers,
+                    to: authenticatedUrl,
                     on: app.eventLoopGroup.next()
                 ) { [weak self] ws in
                     // Set up callbacks synchronously on the WebSocket's event loop
@@ -64,8 +71,14 @@ actor NaraServerConnection {
                     }
                     
                     // Handle close
-                    ws.onClose.whenComplete { [weak self] _ in
+                    ws.onClose.whenComplete { [weak self] result in
                         Task {
+                            switch result {
+                            case .success:
+                                await self?.logger.warning("WebSocket closed normally")
+                            case .failure(let error):
+                                await self?.logger.error("WebSocket closed with error: \(error)")
+                            }
                             await self?.handleDisconnection()
                         }
                     }
@@ -81,14 +94,19 @@ actor NaraServerConnection {
         self.ws = ws
         self.logger.info("✅ Connected to NaraServer WebSocket")
         
+        // Add small delay to allow server to fully establish connection
+        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms delay
+        
         // Send initial connection message
         await self.sendConnectionMessage()
+        self.logger.info("Connection message sent, waiting for server response")
     }
     
     private func sendConnectionMessage() async {
         let connectionMessage: [String: String] = [
             "type": "connection",
-            "deviceId": relayDeviceId,
+            "device_id": relayDeviceId,
+            "platform": "webhook",
             "timestamp": Date().iso8601
         ]
         
