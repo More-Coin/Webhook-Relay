@@ -1,5 +1,6 @@
 import Vapor
 import NIOCore
+import AsyncHTTPClient
 
 actor NaraServerConnection {
     private var ws: WebSocket?
@@ -31,24 +32,13 @@ actor NaraServerConnection {
             logger.info("Connecting to NaraServer WebSocket at \(naraServerWsUrl)")
             
             // Build WebSocket URL with query parameters for authentication
-            var urlComponents = URLComponents(string: naraServerWsUrl)!
-            urlComponents.queryItems = [
-                URLQueryItem(name: "token", value: naraServerApiKey),
-                URLQueryItem(name: "device_id", value: relayDeviceId),
-                URLQueryItem(name: "platform", value: "webhook")
-            ]
+            let urlWithParams = buildWebSocketURL()
             
-            guard let authenticatedUrl = urlComponents.url?.absoluteString else {
-                logger.error("Failed to construct authenticated WebSocket URL")
-                await scheduleReconnect(app: app)
-                return
-            }
-            
-            logger.info("WebSocket URL with auth: \(authenticatedUrl.replacingOccurrences(of: naraServerApiKey, with: "***TOKEN***"))")
+            logger.info("🔧 Built WebSocket URL with auth params [baseURL: \(naraServerWsUrl), finalURL: \(urlWithParams.replacingOccurrences(of: naraServerApiKey, with: "***TOKEN***"))]")
             
             try await app.eventLoopGroup.any().makeFutureWithTask {
                 try await WebSocket.connect(
-                    to: authenticatedUrl,
+                    to: urlWithParams,
                     on: app.eventLoopGroup.next()
                 ) { [weak self] ws in
                     // Set up callbacks synchronously on the WebSocket's event loop
@@ -90,39 +80,33 @@ actor NaraServerConnection {
         }
     }
     
+    private func buildWebSocketURL() -> String {
+        guard var urlComponents = URLComponents(string: naraServerWsUrl) else {
+            logger.warning("Failed to parse base WebSocket URL, using as-is")
+            return naraServerWsUrl
+        }
+        
+        urlComponents.queryItems = [
+            URLQueryItem(name: "token", value: naraServerApiKey),
+            URLQueryItem(name: "device_id", value: relayDeviceId),
+            URLQueryItem(name: "platform", value: "webhook-relay")
+        ]
+        
+        guard let finalURL = urlComponents.url?.absoluteString else {
+            logger.warning("Failed to construct WebSocket URL with query parameters, using base URL")
+            return naraServerWsUrl
+        }
+        
+        return finalURL
+    }
+    
     private func storeWebSocket(_ ws: WebSocket) async {
         self.ws = ws
         self.logger.info("✅ Connected to NaraServer WebSocket")
         
-        // Add small delay to allow server to fully establish connection
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms delay
-        
-        // Send initial connection message
-        await self.sendConnectionMessage()
-        self.logger.info("Connection message sent, waiting for server response")
-    }
-    
-    private func sendConnectionMessage() async {
-        let connectionMessage: [String: String] = [
-            "type": "connection",
-            "device_id": relayDeviceId,
-            "platform": "webhook",
-            "timestamp": Date().iso8601
-        ]
-        
-        do {
-            let jsonData = try JSONEncoder().encode(connectionMessage)
-            if let jsonString = String(data: jsonData, encoding: .utf8) {
-                do {
-                    try await ws?.send(jsonString)
-                    logger.info("Sent connection message to NaraServer")
-                } catch {
-                    logger.error("Failed to send message through WebSocket: \(error)")
-                }
-            }
-        } catch {
-            logger.error("Failed to encode connection message: \(error)")
-        }
+        // Wait for server confirmation instead of sending connection message
+        // Authentication is now handled via URL query parameters
+        self.logger.info("🎧 Waiting for server confirmation message...")
     }
     
     private func handleServerMessage(_ data: String) async {
@@ -132,15 +116,33 @@ actor NaraServerConnection {
         }
         
         do {
-            let serverMessage = try JSONDecoder().decode(ServerMessage.self, from: messageData)
-            logger.info("Received server message: \(serverMessage.type)")
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let serverMessage = try decoder.decode(ServerMessage.self, from: messageData)
+            
+            logger.info("📨 Received server message: \(serverMessage.type) | ID: \(serverMessage.id)")
+            
+            // Handle specific message types
+            switch serverMessage.type {
+            case "connected":
+                logger.info("✅ Server confirmed connection")
+                return
+            case "error":
+                logger.error("❌ Server error: \(serverMessage.entityId ?? "Unknown error")")
+                return
+            default:
+                break
+            }
             
             // Convert server message to AppMessageData format and broadcast
             if let appMessageData = convertServerMessage(serverMessage) {
                 await sseManager.broadcast(data: appMessageData)
+                logger.info("📡 Broadcasted \(serverMessage.type) to SSE clients")
             }
         } catch {
             logger.error("Failed to decode server message: \(error)")
+            logger.debug("Raw message: \(data)")
+            
             // Try to broadcast raw message as fallback
             if let appMessageData = createFallbackMessage(from: data) {
                 await sseManager.broadcast(data: appMessageData)
@@ -149,21 +151,61 @@ actor NaraServerConnection {
     }
     
     private func convertServerMessage(_ serverMessage: ServerMessage) -> AppMessageData? {
-        // This conversion logic will depend on your server message format
-        // For now, creating a generic implementation
+        // Convert NaraServer messages to your app's format
         switch serverMessage.type {
-        case "orderChange", "customerChange", "messageUpdate":
-            // Create an appropriate AppMessageData based on server message
-            // This is a placeholder - adjust based on your actual server message format
+        case "customerChange":
             return AppMessageData(
-                type: serverMessage.type,
-                postbackSenderId: serverMessage.entityId,
-                payload: serverMessage.action,
-                timestamp: Date()
+                type: "customer_update",
+                postbackSenderId: serverMessage.entityId ?? "unknown",
+                payload: "\(serverMessage.action ?? "unknown") customer \(serverMessage.entityId ?? "")",
+                timestamp: serverMessage.timestamp
             )
+            
+        case "orderChange":
+            return AppMessageData(
+                type: "order_update", 
+                postbackSenderId: serverMessage.entityId ?? "unknown",
+                payload: "\(serverMessage.action ?? "unknown") order \(serverMessage.entityId ?? "")",
+                timestamp: serverMessage.timestamp
+            )
+            
+        case "inventoryChange":
+            return AppMessageData(
+                type: "inventory_update",
+                postbackSenderId: serverMessage.entityId ?? "unknown", 
+                payload: "\(serverMessage.action ?? "unknown") \(serverMessage.entityType ?? "item") \(serverMessage.entityId ?? "")",
+                timestamp: serverMessage.timestamp
+            )
+            
+        case "bulkChange":
+            // Handle bulk changes
+            if let bulkChanges = serverMessage.bulkChanges {
+                let summary = "\(bulkChanges.count) bulk changes"
+                return AppMessageData(
+                    type: "bulk_update",
+                    postbackSenderId: "system",
+                    payload: summary,
+                    timestamp: serverMessage.timestamp
+                )
+            }
+            return nil
+            
+        case "messageUpdate":
+            return AppMessageData(
+                type: "message_update",
+                postbackSenderId: serverMessage.entityId ?? "unknown",
+                payload: "\(serverMessage.action ?? "unknown") message",
+                timestamp: serverMessage.timestamp
+            )
+            
         default:
             logger.warning("Unknown server message type: \(serverMessage.type)")
-            return nil
+            return AppMessageData(
+                type: "unknown_update",
+                postbackSenderId: serverMessage.entityId ?? "unknown",
+                payload: "Unknown update type: \(serverMessage.type)",
+                timestamp: serverMessage.timestamp
+            )
         }
     }
     
@@ -217,6 +259,7 @@ actor NaraServerConnection {
         
         do {
             try await ws.send(message)
+            logger.debug("Sent message to NaraServer: \(message.prefix(100))...")
         } catch {
             logger.error("Failed to send message: \(error)")
         }

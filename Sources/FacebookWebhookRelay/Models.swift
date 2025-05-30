@@ -60,7 +60,7 @@ struct AppMessageData: Content {
         self.timestamp = timestamp.iso8601
     }
 
-    // Initializer for postback events
+    // Initializer for postback events and server updates
     init(type: String = "postback", postbackSenderId: String, payload: String, timestamp: Date = Date()) {
         self.type = type
         self.message = nil
@@ -111,11 +111,44 @@ extension Date {
 
 // --- Server Communication Models ---
 struct ServerMessage: Codable {
-    let type: String // "orderChange", "customerChange", etc.
+    let id: UUID
+    let type: String // "customerChange", "orderChange", "inventoryChange", "bulkChange", "connected", "error"
+    let entityId: String?
+    let entityType: String? // "customer", "order", "product", etc.
+    let action: String? // "created", "updated", "deleted"
+    let timestamp: Date
+    let data: Data?
+    let bulkChanges: [BulkChangeItem]?
+    
+    // Custom date decoding to handle ISO8601 strings
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        
+        id = try container.decode(UUID.self, forKey: .id)
+        type = try container.decode(String.self, forKey: .type)
+        entityId = try container.decodeIfPresent(String.self, forKey: .entityId)
+        entityType = try container.decodeIfPresent(String.self, forKey: .entityType)
+        action = try container.decodeIfPresent(String.self, forKey: .action)
+        data = try container.decodeIfPresent(Data.self, forKey: .data)
+        bulkChanges = try container.decodeIfPresent([BulkChangeItem].self, forKey: .bulkChanges)
+        
+        // Handle timestamp - could be Date or ISO8601 string
+        if let date = try? container.decode(Date.self, forKey: .timestamp) {
+            timestamp = date
+        } else if let dateString = try? container.decode(String.self, forKey: .timestamp) {
+            let formatter = ISO8601DateFormatter()
+            timestamp = formatter.date(from: dateString) ?? Date()
+        } else {
+            timestamp = Date()
+        }
+    }
+}
+
+struct BulkChangeItem: Codable {
     let entityId: String
-    let action: String
-    let timestamp: String
-    let data: [String: AnyCodable]? // Dynamic data structure
+    let entityType: String
+    let action: String // "created", "updated", "deleted"
+    let data: Data?
 }
 
 // Helper struct for handling dynamic JSON
