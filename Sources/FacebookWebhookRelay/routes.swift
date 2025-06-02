@@ -1,6 +1,7 @@
 import Vapor
 import Crypto // For HMAC
 import NIOCore
+import NIOHTTP1 // For NIOConnectionError
 import Foundation // For pow function
 
 // Simple in-memory rate limiter
@@ -93,8 +94,30 @@ func routes(_ app: Application) throws {
         await naraServerConnection.connect(app: app)
     }
     
+    // Start periodic status reporting (every 30 seconds)
+    let statusReportingTask = Task {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
+            
+            // Only send status if connected
+            if await naraServerConnection.isConnected() {
+                await naraServerConnection.sendRelayStatus()
+            }
+        }
+    }
+    
     // Ensure clean shutdown
     app.lifecycle.use(NaraServerConnectionLifecycleHandler(connection: naraServerConnection))
+    
+    // Cancel status reporting on shutdown
+    app.lifecycle.use(
+        LifecycleHandler(
+            shutdownAsync: { app in
+                app.logger.info("Cancelling status reporting task")
+                statusReportingTask.cancel()
+            }
+        )
+    )
 
     // --- Middleware for Signature Verification ---
     let facebookSignatureMiddleware = FacebookSignatureMiddleware(appSecret: appSecret)
@@ -124,12 +147,18 @@ func routes(_ app: Application) throws {
     app.grouped(facebookSignatureMiddleware).post("webhook") { req -> HTTPStatus in
         req.logger.info("Received POST /webhook request")
         
+        // Track message received
+        WebhookRelayMetrics.messagesReceived.increment()
+        
         // Apply rate limiting based on sender IP
         let clientIP = req.headers.first(name: "X-Forwarded-For") ?? req.remoteAddress?.description ?? "unknown"
         let allowed = await rateLimiter.shouldAllow(key: clientIP)
         
         guard allowed else {
             req.logger.warning("Rate limit exceeded for IP: \(clientIP)")
+            
+            // Track rate limit error
+            WebhookRelayMetrics.rateLimitErrors.increment()
             
             // Log rate limit exceeded to Firebase
             if let firebase = firebaseService {
@@ -179,6 +208,10 @@ func routes(_ app: Application) throws {
             do {
                 try await forwardToNaraServer(webhookEvent, req: req, naraServerUrl: naraServerUrl, naraServerApiKey: naraServerApiKey, firebaseService: firebaseService)
                 
+                // Track successful forward
+                let forwardDuration = Date().timeIntervalSince(forwardStartTime)
+                WebhookRelayMetrics.recordSuccessfulForward(duration: forwardDuration)
+                
                 // Log successful forwarding
                 if let firebase = firebaseService {
                     let responseTime = Date().timeIntervalSince(forwardStartTime)
@@ -190,8 +223,33 @@ func routes(_ app: Application) throws {
                         messageSize: messageSize
                     )
                 }
+            } catch let error as CircuitBreakerError {
+                // Circuit breaker is open - use fallback strategy
+                req.logger.warning("Circuit breaker prevented forward: \(error)")
+                
+                // Queue the message for later delivery
+                let fallback = MessageQueueFallback(
+                    messageQueue: req.application.messageQueue,
+                    logger: req.logger
+                )
+                
+                try await fallback.execute(webhookEvent)
+                
+                // Track circuit breaker rejection
+                WebhookRelayMetrics.recordFailedForward(reason: "circuit_open")
+                
+                // Continue processing locally as fallback
             } catch {
                 req.logger.error("Failed to forward webhook to NaraServer: \(error)")
+                
+                // Track failed forward
+                let errorReason = (error as? Abort)?.reason ?? "network_error"
+                WebhookRelayMetrics.recordFailedForward(reason: errorReason)
+                
+                // Track network errors specifically
+                if error is URLError || error is NIOConnectionError {
+                    WebhookRelayMetrics.networkErrors.increment()
+                }
                 
                 // Log failed forwarding and error
                 if let firebase = firebaseService {
@@ -314,11 +372,158 @@ func routes(_ app: Application) throws {
     app.get("health") { req async -> HealthStatus in
         let count = await sseManager.getConnectionCount()
         let serverConnected = await naraServerConnection.isConnected()
+        
+        // Get circuit breaker status if available
+        var circuitBreakerStatus: String? = nil
+        if let circuitBreaker = req.application.circuitBreaker {
+            let metrics = await circuitBreaker.getMetrics()
+            circuitBreakerStatus = metrics.state
+            
+            // Update circuit breaker metrics
+            let stateValue: Double = metrics.state.contains("closed") ? 0 : (metrics.state.contains("open") ? 1 : 2)
+            WebhookRelayMetrics.circuitBreakerState.record(stateValue)
+            WebhookRelayMetrics.circuitBreakerFailureRate.record(metrics.windowMetrics.failureRate)
+        }
+        
         return HealthStatus(
             status: "healthy",
             timestamp: Date().iso8601,
             connections: count,
-            serverConnected: serverConnected
+            serverConnected: serverConnected,
+            circuitBreakerState: circuitBreakerStatus
+        )
+    }
+    
+    // --- Queue Health Check Endpoint ---
+    app.get("health", "queue") { req async throws -> QueueHealth in
+        let messageQueue = req.application.messageQueue
+        
+        if let redisQueue = messageQueue as? RedisMessageQueue {
+            return try await redisQueue.healthCheck()
+        } else {
+            // For in-memory queue, create basic health info
+            let size = try await messageQueue.size()
+            let maxSize = 10000 // Default max size
+            return QueueHealth(
+                size: size,
+                maxSize: maxSize,
+                isHealthy: size < maxSize,
+                utilizationPercent: Double(size) / Double(maxSize) * 100
+            )
+        }
+    }
+    
+    // --- Circuit Breaker Status Endpoint ---
+    app.get("circuit-breaker") { req async throws -> Response in
+        guard let circuitBreaker = req.application.circuitBreaker else {
+            throw Abort(.notFound, reason: "Circuit breaker not configured")
+        }
+        
+        let metrics = await circuitBreaker.getMetrics()
+        return try await metrics.encodeResponse(for: req)
+    }
+    
+    // --- Queue Management Endpoints ---
+    
+    // Get queue statistics
+    app.get("admin", "queue", "stats") { req async throws -> Response in
+        guard let queue = req.application.messageQueue as? PersistentMessageQueueProtocol else {
+            throw Abort(.internalServerError, reason: "Persistent queue not configured")
+        }
+        
+        let stats = try await queue.getStatistics()
+        return try await stats.encodeResponse(for: req)
+    }
+    
+    // Get DLQ messages
+    app.get("admin", "queue", "dlq") { req async throws -> Response in
+        guard let dlqManager = req.application.deadLetterQueueManager else {
+            throw Abort(.internalServerError, reason: "DLQ manager not configured")
+        }
+        
+        let limit = req.query[Int.self, at: "limit"] ?? 100
+        let messages = try await dlqManager.getMessages(limit: limit)
+        
+        return try await Response(
+            status: .ok,
+            headers: ["Content-Type": "application/json"],
+            body: .init(data: JSONEncoder().encode(messages))
+        )
+    }
+    
+    // Replay message from DLQ
+    app.post("admin", "queue", "dlq", "replay", ":messageId") { req async throws -> HTTPStatus in
+        guard let dlqManager = req.application.deadLetterQueueManager else {
+            throw Abort(.internalServerError, reason: "DLQ manager not configured")
+        }
+        
+        let messageId = req.parameters.get("messageId") ?? ""
+        try await dlqManager.replayMessage(messageId)
+        
+        return .ok
+    }
+    
+    // Replay messages by time range
+    app.post("admin", "queue", "replay", "time-range") { req async throws -> Response in
+        guard let replayService = req.application.messageReplayService else {
+            throw Abort(.internalServerError, reason: "Replay service not configured")
+        }
+        
+        struct TimeRangeRequest: Content {
+            let from: Date
+            let to: Date
+            let messageType: String?
+            let limit: Int?
+        }
+        
+        let request = try req.content.decode(TimeRangeRequest.self)
+        
+        let filter = MessageFilter(
+            messageType: request.messageType,
+            fromDate: request.from,
+            toDate: request.to,
+            limit: request.limit ?? 1000
+        )
+        
+        let result = try await replayService.replayFromTimeRange(
+            from: request.from,
+            to: request.to,
+            filter: filter
+        )
+        
+        return try await result.encodeResponse(for: req)
+    }
+    
+    // Get queue health
+    app.get("admin", "queue", "health") { req async throws -> Response in
+        guard let monitor = req.application.queueMonitor else {
+            throw Abort(.internalServerError, reason: "Queue monitor not configured")
+        }
+        
+        let health = try await monitor.getQueueHealth()
+        return try await health.encodeResponse(for: req)
+    }
+    
+    // --- Metrics Endpoint ---
+    app.get("metrics") { req async throws -> Response in
+        // Update real-time metrics before export
+        let queueSize = try await req.application.messageQueue.size()
+        WebhookRelayMetrics.updateQueueMetrics(depth: queueSize)
+        
+        let sseConnections = await sseManager.getConnectionCount()
+        let websocketConnected = await naraServerConnection.isConnected()
+        WebhookRelayMetrics.updateConnectionMetrics(
+            sseConnections: sseConnections,
+            websocketConnected: websocketConnected
+        )
+        
+        // Export metrics in Prometheus format
+        let metricsText = PrometheusExporter.export()
+        
+        return Response(
+            status: .ok,
+            headers: ["Content-Type": "text/plain; version=0.0.4"],
+            body: .init(string: metricsText)
         )
     }
     
@@ -341,8 +546,8 @@ func routes(_ app: Application) throws {
         // Collect the request body
         let bodyBuffer = try await req.body.collect(max: 10 * 1024 * 1024).get() // 10MB max
         
-        // Forward the request body to NaraServer
-        let response = try await req.client.post(uri, headers: headers) { clientReq in
+        // Forward the request body to NaraServer with circuit breaker protection
+        let response = try await req.protectedClient.post(uri, headers: headers) { clientReq in
             if let buffer = bodyBuffer {
                 clientReq.body = .init(buffer: buffer)
             }
@@ -479,9 +684,9 @@ func forwardToNaraServer(_ webhookEvent: FacebookWebhookEvent, req: Request, nar
                 throw Abort(.requestTimeout, reason: "Request to NaraServer timed out after \(timeoutSeconds) seconds")
             }
             
-            // Create the request task
+            // Create the request task with circuit breaker protection
             let requestTask = Task {
-                try await req.client.post(uri, headers: headers) { clientReq in
+                try await req.protectedClient.post(uri, headers: headers) { clientReq in
                     try clientReq.content.encode(webhookEvent)
                 }
             }
@@ -590,11 +795,32 @@ func getSenderInfo(senderId: String, req: Request, pageAccessToken: String) asyn
     headers.add(name: .accept, value: "application/json")
 
     do {
-        let response = try await req.client.get(uri, headers: headers)
+        let response = try await req.protectedClient.get(uri, headers: headers)
         let senderInfo = try response.content.decode(SenderInfo.self)
+        
+        // Cache successful response
+        await req.application.responseCache.set(senderId, value: senderInfo)
+        
         return senderInfo
+    } catch let error as CircuitBreakerError {
+        // Circuit breaker is open - use cached response
+        req.logger.warning("Circuit breaker prevented Facebook API call: \(error)")
+        
+        let fallback = CachedResponseFallback(
+            cache: req.application.responseCache,
+            logger: req.logger
+        )
+        
+        return (try? await fallback.execute(senderId)) ?? SenderInfo(firstName: "Unknown", lastName: "User")
     } catch {
         req.logger.error("Error getting sender info for \(senderId): \(error)")
+        
+        // Try cache as last resort
+        if let cached = await req.application.responseCache.get(senderId) as? SenderInfo {
+            req.logger.info("Using cached sender info due to error")
+            return cached
+        }
+        
         return SenderInfo(firstName: "Unknown", lastName: "User")
     }
 }
@@ -690,8 +916,8 @@ func sendMessageToFacebook(_ messageRequest: FacebookSendMessageRequest, pageAcc
     // Convert to Data for the request
     let jsonData = try JSONSerialization.data(withJSONObject: facebookRequest)
     
-    // Send the request to Facebook
-    let response = try await req.client.post(uri, headers: headers) { clientReq in
+    // Send the request to Facebook with circuit breaker protection
+    let response = try await req.protectedClient.post(uri, headers: headers) { clientReq in
         clientReq.body = .init(data: jsonData)
     }
     
@@ -753,8 +979,8 @@ func sendMessageToFacebookWithRetry(_ messageRequest: FacebookSendMessageRequest
     // Convert to Data for the request
     let jsonData = try JSONSerialization.data(withJSONObject: facebookRequest)
     
-    // Send the request to Facebook
-    let response = try await req.client.post(uri, headers: headers) { clientReq in
+    // Send the request to Facebook with circuit breaker protection
+    let response = try await req.protectedClient.post(uri, headers: headers) { clientReq in
         clientReq.body = .init(data: jsonData)
     }
     

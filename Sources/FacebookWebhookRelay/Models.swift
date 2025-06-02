@@ -99,12 +99,14 @@ struct HealthStatus: Content {
     let timestamp: String
     let connections: Int
     let serverConnected: Bool
+    let circuitBreakerState: String?
 }
 
 // Helper for Date to ISO8601 String
 extension Date {
     var iso8601: String {
         let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: self)
     }
 }

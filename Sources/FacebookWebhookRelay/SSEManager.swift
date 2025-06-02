@@ -25,14 +25,26 @@ actor SSEManager {
     }
 
     func broadcast(data: AppMessageData) {
+        // Legacy method - convert to SSE message and broadcast
+        broadcast(message: .legacy(data))
+    }
+    
+    func broadcast(message: SSEMessage) {
         guard !connections.isEmpty else {
             // logger.debug("No SSE connections to broadcast to.") // Optional: less verbose log
             return
         }
 
-        guard let jsonData = try? JSONEncoder().encode(data),
+        // Determine which format to use based on environment variable
+        let useLegacyFormat = Environment.get("SSE_LEGACY_FORMAT") == "true"
+        
+        let dataToEncode: Encodable = useLegacyFormat && message.toLegacyFormat() != nil
+            ? message.toLegacyFormat()!
+            : message
+        
+        guard let jsonData = try? JSONEncoder().encode(dataToEncode),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
-            logger.error("Failed to encode AppMessageData for SSE broadcast.")
+            logger.error("Failed to encode SSE message for broadcast.")
             return
         }
 

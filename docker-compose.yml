@@ -25,6 +25,10 @@ x-shared_environment: &shared_environment
   NARA_SERVER_WS_URL: ${NARA_SERVER_WS_URL:-}
   RELAY_DEVICE_ID: ${RELAY_DEVICE_ID:-webhook_relay_1}
   RELAY_MODE: ${RELAY_MODE:-forward}
+  # Redis Configuration
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+  QUEUE_MAX_SIZE: ${QUEUE_MAX_SIZE:-10000}
+  QUEUE_TTL: ${QUEUE_TTL:-3600}
   # Firebase Configuration (Optional)
   FIREBASE_API_KEY: ${FIREBASE_API_KEY:-}
   FIREBASE_AUTH_DOMAIN: ${FIREBASE_AUTH_DOMAIN:-}
@@ -35,6 +39,21 @@ x-shared_environment: &shared_environment
   FIREBASE_MEASUREMENT_ID: ${FIREBASE_MEASUREMENT_ID:-}
   
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   app:
     image: facebookwebhookrelay:latest
     build:
@@ -43,6 +62,9 @@ services:
       <<: *shared_environment
     ports:
       - '${PORT:-8080}:8080'
+    depends_on:
+      redis:
+        condition: service_healthy
     # user: '0' # uncomment to run as root for testing purposes even though Dockerfile defines 'vapor' user.
     command: ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
     restart: unless-stopped
@@ -52,3 +74,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+volumes:
+  redis_data:
